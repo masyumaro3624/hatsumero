@@ -1,93 +1,149 @@
 'use strict';
 
-let db = null;
+// Firebase imports
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getDatabase, ref, set, push, remove, onValue, get } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+import { getAnalytics } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-analytics.js";
+
+// Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyAbvx55aq5HRRDMOykXbfCdyNVcygjqjlE",
+  authDomain: "hatsumero-81698.firebaseapp.com",
+  databaseURL: "https://hatsumero-81698-default-rtdb.firebaseio.com",
+  projectId: "hatsumero-81698",
+  storageBucket: "hatsumero-81698.firebasestorage.app",
+  messagingSenderId: "719614016527",
+  appId: "1:719614016527:web:e02fc91b0c72453e14377a",
+  measurementId: "G-CZVRHCRN6H"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const analytics = getAnalytics(app);
+const database = getDatabase(app);
+
 let currentStationId = null;
 let stationsData = [];
 let chartsMap = {};
+let dataCache = {
+  observations: {},
+  melodies: {}
+};
 
-// IndexedDB 初期化
-async function initDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open('MelodyObserver', 1);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => {
-      db = req.result;
-      resolve(db);
-    };
-    req.onupgradeneeded = (e) => {
-      const db = e.target.result;
-      if (!db.objectStoreNames.contains('stations')) {
-        db.createObjectStore('stations', { keyPath: 'id' });
+// Firebase Data Store
+class FirebaseDataStore {
+  constructor(db) {
+    this.db = db;
+    this.observationsRef = ref(db, 'observations');
+    this.melodiesRef = ref(db, 'melodies');
+    this.listeners = new Map();
+  }
+
+  async init() {
+    // リアルタイムリスナーを設定
+    onValue(this.observationsRef, (snapshot) => {
+      const data = snapshot.val();
+      dataCache.observations = data || {};
+      this.notifyListeners('observations_updated');
+    });
+
+    onValue(this.melodiesRef, (snapshot) => {
+      const data = snapshot.val();
+      dataCache.melodies = data || {};
+      this.notifyListeners('melodies_updated');
+    });
+
+    return true;
+  }
+
+  async addObservation(obs) {
+    const newObsRef = push(this.observationsRef);
+    obs.id = newObsRef.key;
+    obs.created_at = new Date().toISOString();
+    await set(newObsRef, obs);
+    return obs.id;
+  }
+
+  async deleteObservation(id) {
+    const obsRef = ref(this.db, `observations/${id}`);
+    await remove(obsRef);
+  }
+
+  async saveMelody(melody) {
+    const key = `${melody.station_id}_${melody.platform}`;
+    const melodyRef = ref(this.db, `melodies/${key}`);
+    melody.updated_at = new Date().toISOString();
+    await set(melodyRef, melody);
+  }
+
+  getObservationsByStation(stationId) {
+    const observations = [];
+    for (const key in dataCache.observations) {
+      const obs = dataCache.observations[key];
+      if (obs.station_id === stationId) {
+        observations.push({ ...obs, id: key });
       }
-      if (!db.objectStoreNames.contains('observations')) {
-        const obs = db.createObjectStore('observations', { keyPath: 'id', autoIncrement: true });
-        obs.createIndex('station_id', 'station_id');
+    }
+    return observations;
+  }
+
+  getMelody(stationId, platform) {
+    const key = `${stationId}_${platform}`;
+    return dataCache.melodies[key] || null;
+  }
+
+  on(event, callback) {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, []);
+    }
+    this.listeners.get(event).push(callback);
+  }
+
+  notifyListeners(event) {
+    if (this.listeners.has(event)) {
+      this.listeners.get(event).forEach(cb => cb());
+    }
+  }
+
+  async exportJSON() {
+    const snapshot = await get(ref(this.db, '/'));
+    const data = snapshot.val();
+    return JSON.stringify({
+      observations: data?.observations || {},
+      melodies: data?.melodies || {},
+      exportedAt: new Date().toISOString()
+    }, null, 2);
+  }
+
+  async importJSON(jsonString) {
+    try {
+      const data = JSON.parse(jsonString);
+      
+      if (data.observations) {
+        for (const key in data.observations) {
+          const obsRef = ref(this.db, `observations/${key}`);
+          await set(obsRef, data.observations[key]);
+        }
       }
-      if (!db.objectStoreNames.contains('melodies')) {
-        const mel = db.createObjectStore('melodies', { keyPath: 'id', autoIncrement: true });
-        mel.createIndex('station_id_platform', ['station_id', 'platform'], { unique: true });
+      
+      if (data.melodies) {
+        for (const key in data.melodies) {
+          const melRef = ref(this.db, `melodies/${key}`);
+          await set(melRef, data.melodies[key]);
+        }
       }
-    };
-  });
+      
+      return true;
+    } catch(e) {
+      console.error('Import error:', e);
+      return false;
+    }
+  }
 }
 
-// DB操作関数
-function dbGet(store, key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const req = tx.objectStore(store).get(key);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => resolve(req.result);
-  });
-}
+const dataStore = new FirebaseDataStore(database);
 
-function dbGetAll(store) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const req = tx.objectStore(store).getAll();
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => resolve(req.result);
-  });
-}
-
-function dbAdd(store, data) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    const req = tx.objectStore(store).add(data);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => resolve(req.result);
-  });
-}
-
-function dbPut(store, data) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    const req = tx.objectStore(store).put(data);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => resolve(req.result);
-  });
-}
-
-function dbDelete(store, key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
-    const req = tx.objectStore(store).delete(key);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => resolve(req.result);
-  });
-}
-
-function dbQuery(store, indexName, value) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const index = tx.objectStore(store).index(indexName);
-    const req = index.getAll(value);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => resolve(req.result);
-  });
-}
-
-// ユーティリティ
+// ユーティリティ関数
 function log(...a){ console.log('[app]', ...a); }
 function escapeHtml(s){ if(s==null) return ''; return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function isoLocalDatetime(dt){ const pad=n=>String(n).padStart(2,'0'); return `${dt.getFullYear()}-${pad(dt.getMonth()+1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`; }
@@ -115,10 +171,7 @@ function wilson_interval(k, n, z = 1.96) {
   return [Math.max(0.0, center - margin), Math.min(1.0, center + margin)];
 }
 
-// stops.txt から駅データを読み込む
 async function loadStationsFromCSV() {
-  const existing = await dbGetAll('stations');
-  
   try {
     const response = await fetch('./stops.txt');
     if (!response.ok) throw new Error('stops.txt が見つかりません');
@@ -131,7 +184,7 @@ async function loadStationsFromCSV() {
     const stopLatIdx = header.indexOf('stop_lat');
     const stopLonIdx = header.indexOf('stop_lon');
 
-    let id = 1;
+    stationsData = [];
     for (let i = 1; i < lines.length; i++) {
       if (!lines[i].trim()) continue;
       const cols = lines[i].split(',');
@@ -143,24 +196,16 @@ async function loadStationsFromCSV() {
       const lon = stopLonIdx >= 0 && cols[stopLonIdx] ? parseFloat(cols[stopLonIdx]) : null;
 
       if (stop_id && station_name) {
-        await dbPut('stations', { id, stop_id, station_name, lat, lon });
-        id++;
+        stationsData.push({ id: i, stop_id, station_name, lat, lon });
       }
     }
-    log(`${id - 1}件の駅を読み込みました`);
+    
+    stationsData.sort((a, b) => a.station_name.localeCompare(b.station_name, 'ja'));
+    log(`${stationsData.length}件の駅を読み込みました`);
+    renderStationList();
   } catch(err) {
     log('stops.txt 読み込みエラー:', err);
     showToast('駅データの読み込みに失敗しました');
-  }
-}
-
-async function fetchStations(){
-  try {
-    stationsData = await dbGetAll('stations');
-    stationsData.sort((a, b) => a.station_name.localeCompare(b.station_name, 'ja'));
-    renderStationList();
-  } catch(err){
-    log('fetchStations', err);
   }
 }
 
@@ -182,10 +227,11 @@ function renderStationList(filterText = ''){
   ).join('');
 }
 
-async function selectStation(id, name){
+window.selectStation = async function(id, name){
   currentStationId = id;
   document.querySelectorAll('.station-option').forEach(el => el.classList.remove('active'));
-  document.querySelector(`[data-id="${id}"]`).classList.add('active');
+  const el = document.querySelector(`[data-id="${id}"]`);
+  if(el) el.classList.add('active');
   await showStats();
 }
 
@@ -223,34 +269,23 @@ async function submitForm(e){
       reported_at: toISOStringFromLocalInput(reported_at_val),
       destination,
       note,
-      token: Math.random().toString(36).substr(2, 16),
-      created_at: new Date().toISOString()
+      token: Math.random().toString(36).substr(2, 16)
     };
 
     setButtonLoading(btn, true);
-    const obsId = await dbAdd('observations', obs);
+    const obsId = await dataStore.addObservation(obs);
     localStorage.setItem('melody_token_' + obsId, obs.token);
-    showToast('✓ 投稿しました');
+    showToast('✓ 投稿しました（リアルタイム同期中...）');
     document.getElementById('choruses').value='0';
     document.getElementById('note').value='';
     document.getElementById('destination').value='';
     document.getElementById('reported_at').value = isoLocalDatetime(new Date());
-    await showStats();
   }catch(err){
     log('submitForm',err);
     showToast('エラーが発生しました');
   }finally{
     setButtonLoading(btn, false);
   }
-}
-
-function formatHourKey(isoHour){
-  try{
-    const d=new Date(isoHour);
-    if(isNaN(d.getTime())) return isoHour;
-    const pad=n=>String(n).padStart(2,'0');
-    return `${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:00`;
-  }catch(e){ return isoHour; }
 }
 
 function formatTime(iso){
@@ -261,7 +296,7 @@ function formatTime(iso){
   }catch(e){ return iso; }
 }
 
-async function deleteObservation(obsId){
+window.deleteObservation = async function(obsId){
   const token = localStorage.getItem('melody_token_' + obsId);
   if(!token){
     showToast('削除権限がありません');
@@ -271,7 +306,7 @@ async function deleteObservation(obsId){
     return;
   }
   try{
-    await dbDelete('observations', obsId);
+    await dataStore.deleteObservation(obsId);
     localStorage.removeItem('melody_token_' + obsId);
     showToast('削除しました');
     await showStats();
@@ -280,22 +315,16 @@ async function deleteObservation(obsId){
   }
 }
 
-async function saveMelodyName(platform){
+window.saveMelodyName = async function(platform){
   const melodyName = prompt('メロディー名を入力してください（例: ジングルベル）');
   if(!melodyName) return;
   
   try{
-    const existing = await dbQuery('melodies', 'station_id_platform', [currentStationId, Number(platform)]);
-    if (existing.length > 0) {
-      existing[0].melody_name = melodyName;
-      await dbPut('melodies', existing[0]);
-    } else {
-      await dbAdd('melodies', {
-        station_id: currentStationId,
-        platform: Number(platform),
-        melody_name: melodyName
-      });
-    }
+    await dataStore.saveMelody({
+      station_id: currentStationId,
+      platform: Number(platform),
+      melody_name: melodyName
+    });
     showToast('メロディー情報を保存しました');
     await showStats();
   }catch(err){
@@ -303,7 +332,7 @@ async function saveMelodyName(platform){
   }
 }
 
-function openModal(platNum, latest){
+window.openModal = function(platNum, latest){
   const modal = document.getElementById('detailsModal');
   const body = document.getElementById('modalBody');
   document.getElementById('modalTitle').textContent = `番線 ${platNum} — 直近5件の観測`;
@@ -322,94 +351,17 @@ function openModal(platNum, latest){
         <div class="obs-chorus">${o.choruses} コーラス ${isSuccess?'✓ 成功':'✗ 失敗'}</div>
         ${o.note?`<div style="color:var(--muted);font-size:12px">メモ: ${escapeHtml(o.note)}</div>`:''}
       </div>
-      <button class="obs-delete" onclick="deleteObservation(${o.id})">削除</button>
+      <button class="obs-delete" onclick="deleteObservation('${o.id}')">削除</button>
     </div>`;
   });
   html += '</div>';
-
-  const successes = latest.filter(o => o.choruses >= 1.0);
-  if(successes.length > 0){
-    html += '<h4>✓ なった投稿</h4>';
-    successes.forEach(o=>{
-      const time = o.reported_at ? formatTime(o.reported_at) : '時刻未記録';
-      const dest = o.destination || '行き先未記録';
-      html += `<div style="padding:10px;background:#d1fae5;border-radius:6px;margin-bottom:8px;border-left:4px solid var(--success)">
-        ${escapeHtml(time)} — ${escapeHtml(dest)} — <strong>${o.choruses} コーラス</strong>
-      </div>`;
-    });
-  }
-
-  const fails = latest.filter(o => o.choruses < 1.0);
-  if(fails.length > 0){
-    html += '<h4 style="margin-top:16px">✗ ならなかった投稿</h4>';
-    fails.forEach(o=>{
-      const time = o.reported_at ? formatTime(o.reported_at) : '時刻未記録';
-      const dest = o.destination || '行き先未記録';
-      html += `<div style="padding:10px;background:#fee2e2;border-radius:6px;margin-bottom:8px;border-left:4px solid var(--fail)">
-        ${escapeHtml(time)} — ${escapeHtml(dest)} — <strong>${o.choruses} コーラス</strong>
-      </div>`;
-    });
-  }
 
   body.innerHTML = html;
   modal.classList.add('active');
 }
 
-function closeModal(){
+window.closeModal = function(){
   document.getElementById('detailsModal').classList.remove('active');
-}
-
-function closeFileModal(){
-  document.getElementById('fileInputModal').classList.remove('active');
-}
-
-async function uploadStopsFile() {
-  const fileInput = document.getElementById('stopsFileInput');
-  const file = fileInput.files[0];
-  if (!file) {
-    showToast('ファイルを選択してください');
-    return;
-  }
-
-  try {
-    const text = await file.text();
-    const lines = text.split('\n');
-    const header = lines[0].split(',');
-    const stopIdIdx = header.indexOf('stop_id');
-    const stopNameIdx = header.indexOf('stop_name');
-    const stopLatIdx = header.indexOf('stop_lat');
-    const stopLonIdx = header.indexOf('stop_lon');
-
-    if (stopIdIdx === -1 || stopNameIdx === -1) {
-      showToast('stop_id または stop_name が見つかりません');
-      return;
-    }
-
-    let addedCount = 0;
-    for (let i = 1; i < lines.length; i++) {
-      if (!lines[i].trim()) continue;
-      const cols = lines[i].split(',');
-      if (cols.length < stopNameIdx + 1) continue;
-
-      const id = i;
-      const stop_id = cols[stopIdIdx].trim();
-      const station_name = cols[stopNameIdx].trim();
-      const lat = stopLatIdx >= 0 ? parseFloat(cols[stopLatIdx]) : null;
-      const lon = stopLonIdx >= 0 ? parseFloat(cols[stopLonIdx]) : null;
-
-      if (stop_id && station_name) {
-        await dbPut('stations', { id, stop_id, station_name, lat, lon });
-        addedCount++;
-      }
-    }
-
-    await fetchStations();
-    closeFileModal();
-    showToast(`✓ ${addedCount}件の駅を読み込みました`);
-  } catch(err) {
-    log('uploadStopsFile', err);
-    showToast('ファイルの読み込みに失敗しました');
-  }
 }
 
 function renderHourlyChart(platNum, hourly_map) {
@@ -474,20 +426,19 @@ async function showStats(){
     if(!currentStationId) return;
     
     const target = document.getElementById('stationStats');
-    const station = await dbGet('stations', currentStationId);
+    const station = stationsData.find(s => s.id === currentStationId);
     if (!station) { 
       target.innerHTML = '<div class="card"><p style="color:var(--fail)">駅情報が見つかりません</p></div>'; 
       return; 
     }
 
-    const obs_all = await dbQuery('observations', 'station_id', currentStationId);
+    const obs_all = dataStore.getObservationsByStation(currentStationId);
     const total = obs_all.length;
     const k = obs_all.filter(o => o.choruses >= 1.0).length;
-    const p_hat = total > 0 ? k / total : 0;
     const [ci_low, ci_high] = wilson_interval(k, total);
 
     let html = `<div class="card">
-      <h2 style="margin-top:0">${escapeHtml(station.station_name)}</h2>
+      <h2 style="margin-top:0">${escapeHtml(station.station_name)} <span style="font-size:14px;color:#10b981;margin-left:8px">🔄 リアルタイム同期中</span></h2>
       <p style="color:var(--muted);margin:0">全観測数: ${total} 件 | 成功: ${k} 件</p>
     </div>`;
 
@@ -510,10 +461,9 @@ async function showStats(){
         const [lowp, highp] = wilson_interval(kk, n);
         const fillPercent = ph * 100;
 
-        const melodies = await dbQuery('melodies', 'station_id_platform', [currentStationId, Number(platNum)]);
-        const melodyName = melodies.length > 0 ? melodies[0].melody_name : '未設定';
+        const melody = dataStore.getMelody(currentStationId, Number(platNum));
+        const melodyName = melody ? melody.melody_name : '未設定';
 
-        // 時間帯別集計
         const hourly_map = {};
         for (const o of obs_plat) {
           if (o.reported_at) {
@@ -585,7 +535,6 @@ async function showStats(){
 
     target.innerHTML = html;
 
-    // グラフ描画
     setTimeout(() => {
       for (const platNum of Object.keys(platforms_map)) {
         const obs_plat = platforms_map[platNum];
@@ -610,13 +559,58 @@ async function showStats(){
   }
 }
 
+window.exportData = async function() {
+  try {
+    const json = await dataStore.exportJSON();
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `melody-observer-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('データをエクスポートしました');
+  } catch(err) {
+    log('exportData error:', err);
+    showToast('エクスポートに失敗しました');
+  }
+}
+
+window.importData = function() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'application/json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    
+    try {
+      const text = await file.text();
+      const success = await dataStore.importJSON(text);
+      if (success) {
+        showToast('データをインポートしました');
+      } else {
+        showToast('インポートに失敗しました');
+      }
+    } catch(err) {
+      log('importData error:', err);
+      showToast('インポートに失敗しました');
+    }
+  };
+  input.click();
+}
+
 window.addEventListener('load', async ()=>{
   try {
-    await initDB();
+    showToast('🔄 Firebase接続中...');
+    await dataStore.init();
+    showToast('✓ Firebase接続完了');
+    
     await loadStationsFromCSV();
-    await fetchStations();
+    
     const reportedAtInput = document.getElementById('reported_at');
     if(reportedAtInput) reportedAtInput.value = isoLocalDatetime(new Date());
+    
     const form = document.getElementById('obsForm');
     if(form) form.addEventListener('submit', submitForm);
     
@@ -627,8 +621,22 @@ window.addEventListener('load', async ()=>{
       });
     }
 
+    // リアルタイム更新リスナー
+    dataStore.on('observations_updated', async () => {
+      if (currentStationId) {
+        await showStats();
+      }
+    });
+
+    dataStore.on('melodies_updated', async () => {
+      if (currentStationId) {
+        await showStats();
+      }
+    });
+
   } catch(err) {
     log('init error', err);
+    showToast('初期化エラーが発生しました');
   }
 });
 
